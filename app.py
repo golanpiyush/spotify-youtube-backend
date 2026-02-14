@@ -124,9 +124,63 @@ def convert_tracks():
         print(f"❌ Server error: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
+
+@app.route('/api/debug-playlist', methods=['POST', 'OPTIONS'])
+def debug_playlist():
+    """Debug endpoint to see raw Spotify data"""
+    if request.method == 'OPTIONS':
+        return '', 200
+    
+    try:
+        data = request.json
+        spotify_url = data.get('url')
+        
+        if not spotify_url:
+            return jsonify({'error': 'No Spotify URL provided'}), 400
+        
+        # Extract playlist ID
+        playlist_id_match = re.search(r'playlist/([a-zA-Z0-9]+)', spotify_url)
+        if not playlist_id_match:
+            return jsonify({'error': 'Invalid Spotify playlist URL'}), 400
+        
+        playlist_id = playlist_id_match.group(1)
+        
+        # Scrape embed page
+        import requests
+        from bs4 import BeautifulSoup
+        import json
+        
+        embed_url = f"https://open.spotify.com/embed/playlist/{playlist_id}"
+        response = requests.get(embed_url, headers={
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        })
+        
+        soup = BeautifulSoup(response.text, 'html.parser')
+        script_tag = soup.find('script', {'id': '__NEXT_DATA__'})
+        
+        if not script_tag:
+            return jsonify({'error': 'Could not parse playlist data'}), 400
+        
+        playlist_data = json.loads(script_tag.string)
+        entity = playlist_data['props']['pageProps']['state']['data']['entity']
+        
+        # Return RAW data for inspection
+        return jsonify({
+            'entity_keys': list(entity.keys()),
+            'subtitle': entity.get('subtitle'),
+            'ownerV2': entity.get('ownerV2'),
+            'owner': entity.get('owner'),
+            'first_track': entity.get('trackList', [])[0] if entity.get('trackList') else None,
+            'first_track_keys': list(entity.get('trackList', [])[0].keys()) if entity.get('trackList') else None,
+        })
+        
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
+    
 @app.route('/api/playlist', methods=['POST', 'OPTIONS'])
 def import_playlist():
-    """Import Spotify playlist with HQ album art for each track"""
+    """Import Spotify playlist with FAST parallel album art fetching"""
     if request.method == 'OPTIONS':
         return '', 200
     
@@ -146,95 +200,140 @@ def import_playlist():
         
         playlist_id = playlist_id_match.group(1)
         
-        # Scrape Spotify embed page
+        # Fetch playlist embed page
         import requests
         from bs4 import BeautifulSoup
         import json
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import time
         
         embed_url = f"https://open.spotify.com/embed/playlist/{playlist_id}"
+        print(f"🌐 Fetching playlist: {embed_url}")
+        
         response = requests.get(embed_url, headers={
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        })
+        }, timeout=10)
         
         if response.status_code != 200:
             return jsonify({'error': f'Failed to fetch playlist: {response.status_code}'}), 400
         
-        # Parse JSON from __NEXT_DATA__
         soup = BeautifulSoup(response.text, 'html.parser')
         script_tag = soup.find('script', {'id': '__NEXT_DATA__'})
         
         if not script_tag:
             return jsonify({'error': 'Could not parse playlist data'}), 400
         
-        playlist_data = json.loads(script_tag.string)
-        entity = playlist_data['props']['pageProps']['state']['data']['entity']
+        page_data = json.loads(script_tag.string)
+        entity = page_data['props']['pageProps']['state']['data']['entity']
         
         # Extract playlist metadata
         playlist_name = entity.get('name', 'Unknown Playlist')
         playlist_description = entity.get('description')
+        owner_name = entity.get('subtitle', 'Spotify User').strip() or 'Spotify User'
         
-        # Extract HQ playlist cover art
-        cover_image_url = None
-        cover_art = entity.get('coverArt', {})
-        sources = cover_art.get('sources', [])
-        if sources:
-            # Get the LARGEST image (last in array)
-            cover_image_url = sources[-1].get('url')
-        
-        print(f"🖼️ Playlist cover: {cover_image_url}")
-        
-        # Extract owner name with fallbacks
-        owner_name = 'Spotify User'
-        
-        # Try subtitle field
-        subtitle = entity.get('subtitle', '')
-        if subtitle and ' · ' in subtitle:
-            parts = subtitle.split(' · ')
-            if len(parts) >= 2:
-                owner_name = parts[1].strip()
-        
-        # Try ownerV2
-        if owner_name == 'Spotify User':
-            owner_v2 = entity.get('ownerV2', {})
-            owner_data = owner_v2.get('data', {})
-            if owner_data.get('name'):
-                owner_name = owner_data['name']
-        
+        print(f"📋 Playlist: {playlist_name}")
         print(f"👤 Owner: {owner_name}")
         
-        # Extract tracks with individual album art
-        track_list = entity.get('trackList', [])
-        print(f"📝 Found {len(track_list)} tracks")
+        # Playlist cover
+        cover_art = entity.get('coverArt', {})
+        sources = cover_art.get('sources', [])
+        cover_image_url = sources[-1].get('url') if sources else None
         
-        tracks = []
-        for i, track in enumerate(track_list):
-            track_title = track.get('title', 'Unknown')
-            track_subtitle = track.get('subtitle', '')
-            track_artists = [a.strip() for a in track_subtitle.split(',')] if track_subtitle else ['Unknown Artist']
+        # Extract track list
+        track_list = entity.get('trackList', [])
+        print(f"📝 Found {len(track_list)} tracks\n")
+        
+        # Prepare track data
+        track_data_list = []
+        for track_data in track_list:
+            track_title = track_data.get('title', 'Unknown')
+            subtitle = track_data.get('subtitle', '')
+            track_artists = [a.strip() for a in subtitle.split(',')] if subtitle else ['Unknown Artist']
+            track_uri = track_data.get('uri', '')
+            track_id = track_uri.split(':')[-1] if ':' in track_uri else None
             
-            # Extract INDIVIDUAL track album art
-            track_album_art = None
-            track_image = track.get('image', {})
-            track_image_sources = track_image.get('sources', [])
-            if track_image_sources:
-                # Get the LARGEST image for HQ quality
-                track_album_art = track_image_sources[-1].get('url')
-            
-            print(f"  [{i+1}] {track_title}")
-            print(f"      Album art: {track_album_art if track_album_art else 'None - will use playlist cover'}")
-            
-            tracks.append({
+            track_data_list.append({
                 'title': track_title,
                 'artists': track_artists,
-                'albumArt': track_album_art or cover_image_url,  # Fallback to playlist cover
+                'track_id': track_id,
             })
         
-        # Convert to YouTube IDs
-        results = []
-        for i, track in enumerate(tracks, 1):
+        # PARALLEL fetch album art for all tracks
+        start_time = time.time()
+        print(f"🚀 Fetching album art for {len(track_data_list)} tracks in parallel...\n")
+        
+        def fetch_track_album_art(track_info):
+            """Fetch album art for a single track"""
+            track_id = track_info['track_id']
+            track_title = track_info['title']
+            
+            if not track_id:
+                return cover_image_url
+            
             try:
-                query = f"{' '.join(track['artists'])} {track['title']} official audio"
-                print(f"🔍 [{i}/{len(tracks)}] Searching: {query}")
+                track_embed_url = f"https://open.spotify.com/embed/track/{track_id}"
+                track_response = requests.get(track_embed_url, headers={
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                }, timeout=3)  # Shorter timeout
+                
+                if track_response.status_code == 200:
+                    track_soup = BeautifulSoup(track_response.text, 'html.parser')
+                    track_script = track_soup.find('script', {'id': '__NEXT_DATA__'})
+                    
+                    if track_script:
+                        track_json = json.loads(track_script.string)
+                        track_entity = track_json['props']['pageProps']['state']['data']['entity']
+                        track_cover = track_entity.get('coverArt', {})
+                        track_sources = track_cover.get('sources', [])
+                        
+                        if track_sources:
+                            album_art = track_sources[-1].get('url')
+                            print(f"  ✅ {track_title[:40]} - Got album art")
+                            return album_art
+                
+                print(f"  ⚠️  {track_title[:40]} - Using playlist cover")
+                return cover_image_url
+                
+            except Exception as e:
+                print(f"  ❌ {track_title[:40]} - Error: {str(e)[:30]}")
+                return cover_image_url
+        
+        # Fetch album art in parallel (max 10 threads)
+        album_arts = []
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            future_to_track = {
+                executor.submit(fetch_track_album_art, track_info): i 
+                for i, track_info in enumerate(track_data_list)
+            }
+            
+            # Collect results in order
+            results_dict = {}
+            for future in as_completed(future_to_track):
+                index = future_to_track[future]
+                results_dict[index] = future.result()
+            
+            # Sort by index to maintain order
+            album_arts = [results_dict[i] for i in range(len(track_data_list))]
+        
+        elapsed = time.time() - start_time
+        print(f"\n⚡ Album art fetching complete in {elapsed:.1f}s\n")
+        
+        # Combine track data with album art
+        tracks = []
+        for i, track_info in enumerate(track_data_list):
+            tracks.append({
+                'title': track_info['title'],
+                'artists': track_info['artists'],
+                'albumArt': album_arts[i],
+            })
+        
+        # Convert to YouTube IDs (also parallel)
+        print(f"🔍 Converting to YouTube IDs in parallel...\n")
+        
+        def fetch_youtube_id(track_info):
+            """Fetch YouTube ID for a single track"""
+            try:
+                query = f"{' '.join(track_info['artists'])} {track_info['title']} official audio"
                 
                 with yt_dlp.YoutubeDL(YDL_OPTS) as ydl:
                     info = ydl.extract_info(f"ytsearch1:{query}", download=False)
@@ -242,48 +341,59 @@ def import_playlist():
                     if info and 'entries' in info and len(info['entries']) > 0:
                         video = info['entries'][0]
                         video_id = video.get('id')
-                        
-                        print(f"   ✅ Found: {video_id}")
-                        
-                        results.append({
-                            'title': track['title'],
-                            'artists': track['artists'],
+                        print(f"  ✅ {track_info['title'][:40]} -> {video_id}")
+                        return {
                             'youtubeId': video_id,
                             'youtubeTitle': video.get('title'),
                             'duration': video.get('duration'),
-                            'albumArt': track['albumArt'],  # Use Spotify album art, NOT YouTube thumbnail
                             'success': True,
-                        })
+                        }
                     else:
-                        print(f"   ❌ No results")
-                        results.append({
-                            'title': track['title'],
-                            'artists': track['artists'],
-                            'youtubeId': None,
-                            'albumArt': track['albumArt'],
-                            'success': False,
-                            'error': 'No results found',
-                        })
+                        print(f"  ❌ {track_info['title'][:40]} - No results")
+                        return {'youtubeId': None, 'success': False, 'error': 'No results found'}
             except Exception as e:
-                print(f"   ❌ Error: {str(e)}")
-                results.append({
-                    'title': track['title'],
-                    'artists': track['artists'],
-                    'youtubeId': None,
-                    'albumArt': track['albumArt'],
-                    'success': False,
-                    'error': str(e),
-                })
+                print(f"  ❌ {track_info['title'][:40]} - Error: {str(e)[:30]}")
+                return {'youtubeId': None, 'success': False, 'error': str(e)}
+        
+        # Fetch YouTube IDs in parallel
+        youtube_results = []
+        with ThreadPoolExecutor(max_workers=5) as executor:  # Fewer threads for yt-dlp
+            future_to_track = {
+                executor.submit(fetch_youtube_id, track): i 
+                for i, track in enumerate(tracks)
+            }
+            
+            results_dict = {}
+            for future in as_completed(future_to_track):
+                index = future_to_track[future]
+                results_dict[index] = future.result()
+            
+            youtube_results = [results_dict[i] for i in range(len(tracks))]
+        
+        # Combine everything
+        results = []
+        for i, track in enumerate(tracks):
+            yt_data = youtube_results[i]
+            results.append({
+                'title': track['title'],
+                'artists': track['artists'],
+                'youtubeId': yt_data.get('youtubeId'),
+                'youtubeTitle': yt_data.get('youtubeTitle'),
+                'duration': yt_data.get('duration'),
+                'albumArt': track['albumArt'],
+                'success': yt_data.get('success', False),
+                'error': yt_data.get('error'),
+            })
         
         successful = sum(1 for r in results if r['success'])
-        print(f"🎉 Complete: {successful}/{len(tracks)} tracks")
+        print(f"\n🎉 Complete: {successful}/{len(tracks)} tracks")
         
         return jsonify({
             'playlist': {
                 'name': playlist_name,
                 'id': playlist_id,
                 'description': playlist_description,
-                'coverImageUrl': cover_image_url,  # HQ playlist cover
+                'coverImageUrl': cover_image_url,
                 'ownerName': owner_name,
             },
             'results': results,
@@ -295,7 +405,7 @@ def import_playlist():
         })
         
     except Exception as e:
-        print(f"❌ Error: {str(e)}")
+        print(f"\n❌ Error: {str(e)}")
         import traceback
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
