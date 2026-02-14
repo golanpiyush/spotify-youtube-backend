@@ -126,7 +126,7 @@ def convert_tracks():
 
 @app.route('/api/playlist', methods=['POST', 'OPTIONS'])
 def import_playlist():
-    """Import Spotify playlist and convert to YouTube IDs"""
+    """Import Spotify playlist with HQ album art for each track"""
     if request.method == 'OPTIONS':
         return '', 200
     
@@ -139,7 +139,7 @@ def import_playlist():
         
         print(f"🎵 Importing playlist: {spotify_url}")
         
-        # Extract playlist ID from URL
+        # Extract playlist ID
         playlist_id_match = re.search(r'playlist/([a-zA-Z0-9]+)', spotify_url)
         if not playlist_id_match:
             return jsonify({'error': 'Invalid Spotify playlist URL'}), 400
@@ -157,9 +157,9 @@ def import_playlist():
         })
         
         if response.status_code != 200:
-            return jsonify({'error': 'Failed to fetch playlist'}), 400
+            return jsonify({'error': f'Failed to fetch playlist: {response.status_code}'}), 400
         
-        # Parse HTML and extract JSON data
+        # Parse JSON from __NEXT_DATA__
         soup = BeautifulSoup(response.text, 'html.parser')
         script_tag = soup.find('script', {'id': '__NEXT_DATA__'})
         
@@ -169,18 +169,64 @@ def import_playlist():
         playlist_data = json.loads(script_tag.string)
         entity = playlist_data['props']['pageProps']['state']['data']['entity']
         
-        # Extract playlist info
+        # Extract playlist metadata
         playlist_name = entity.get('name', 'Unknown Playlist')
+        playlist_description = entity.get('description')
+        
+        # Extract HQ playlist cover art
+        cover_image_url = None
+        cover_art = entity.get('coverArt', {})
+        sources = cover_art.get('sources', [])
+        if sources:
+            # Get the LARGEST image (last in array)
+            cover_image_url = sources[-1].get('url')
+        
+        print(f"🖼️ Playlist cover: {cover_image_url}")
+        
+        # Extract owner name with fallbacks
+        owner_name = 'Spotify User'
+        
+        # Try subtitle field
+        subtitle = entity.get('subtitle', '')
+        if subtitle and ' · ' in subtitle:
+            parts = subtitle.split(' · ')
+            if len(parts) >= 2:
+                owner_name = parts[1].strip()
+        
+        # Try ownerV2
+        if owner_name == 'Spotify User':
+            owner_v2 = entity.get('ownerV2', {})
+            owner_data = owner_v2.get('data', {})
+            if owner_data.get('name'):
+                owner_name = owner_data['name']
+        
+        print(f"👤 Owner: {owner_name}")
+        
+        # Extract tracks with individual album art
         track_list = entity.get('trackList', [])
+        print(f"📝 Found {len(track_list)} tracks")
         
-        print(f"📋 Found {len(track_list)} tracks in '{playlist_name}'")
-        
-        # Convert tracks to standard format
         tracks = []
-        for track in track_list:
+        for i, track in enumerate(track_list):
+            track_title = track.get('title', 'Unknown')
+            track_subtitle = track.get('subtitle', '')
+            track_artists = [a.strip() for a in track_subtitle.split(',')] if track_subtitle else ['Unknown Artist']
+            
+            # Extract INDIVIDUAL track album art
+            track_album_art = None
+            track_image = track.get('image', {})
+            track_image_sources = track_image.get('sources', [])
+            if track_image_sources:
+                # Get the LARGEST image for HQ quality
+                track_album_art = track_image_sources[-1].get('url')
+            
+            print(f"  [{i+1}] {track_title}")
+            print(f"      Album art: {track_album_art if track_album_art else 'None - will use playlist cover'}")
+            
             tracks.append({
-                'title': track.get('title', ''),
-                'artists': [a.strip() for a in track.get('subtitle', '').split(',')],
+                'title': track_title,
+                'artists': track_artists,
+                'albumArt': track_album_art or cover_image_url,  # Fallback to playlist cover
             })
         
         # Convert to YouTube IDs
@@ -188,7 +234,7 @@ def import_playlist():
         for i, track in enumerate(tracks, 1):
             try:
                 query = f"{' '.join(track['artists'])} {track['title']} official audio"
-                print(f"[{i}/{len(tracks)}] Searching: {query}")
+                print(f"🔍 [{i}/{len(tracks)}] Searching: {query}")
                 
                 with yt_dlp.YoutubeDL(YDL_OPTS) as ydl:
                     info = ydl.extract_info(f"ytsearch1:{query}", download=False)
@@ -197,37 +243,48 @@ def import_playlist():
                         video = info['entries'][0]
                         video_id = video.get('id')
                         
+                        print(f"   ✅ Found: {video_id}")
+                        
                         results.append({
                             'title': track['title'],
                             'artists': track['artists'],
                             'youtubeId': video_id,
                             'youtubeTitle': video.get('title'),
-                            'thumbnail': f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
+                            'duration': video.get('duration'),
+                            'albumArt': track['albumArt'],  # Use Spotify album art, NOT YouTube thumbnail
                             'success': True,
                         })
                     else:
+                        print(f"   ❌ No results")
                         results.append({
                             'title': track['title'],
                             'artists': track['artists'],
                             'youtubeId': None,
+                            'albumArt': track['albumArt'],
                             'success': False,
                             'error': 'No results found',
                         })
             except Exception as e:
+                print(f"   ❌ Error: {str(e)}")
                 results.append({
                     'title': track['title'],
                     'artists': track['artists'],
                     'youtubeId': None,
+                    'albumArt': track['albumArt'],
                     'success': False,
                     'error': str(e),
                 })
         
         successful = sum(1 for r in results if r['success'])
+        print(f"🎉 Complete: {successful}/{len(tracks)} tracks")
         
         return jsonify({
             'playlist': {
                 'name': playlist_name,
                 'id': playlist_id,
+                'description': playlist_description,
+                'coverImageUrl': cover_image_url,  # HQ playlist cover
+                'ownerName': owner_name,
             },
             'results': results,
             'summary': {
@@ -239,6 +296,8 @@ def import_playlist():
         
     except Exception as e:
         print(f"❌ Error: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
